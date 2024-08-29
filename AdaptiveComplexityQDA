@@ -1,0 +1,94 @@
+import numpy as np
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
+from sklearn.utils.multiclass import unique_labels
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+from sklearn.neighbors import NearestNeighbors
+
+class AdaptiveComplexityQDA(BaseEstimator, ClassifierMixin):
+    def __init__(self, n_neighbors=5, complexity_threshold=0.5, reg_param=1e-4):
+        self.n_neighbors = n_neighbors
+        self.complexity_threshold = complexity_threshold
+        self.reg_param = reg_param
+
+    def fit(self, X, y):
+        # Check that X and y have correct shape
+        X, y = check_X_y(X, y)
+        
+        # Store the classes seen during fit
+        self.classes_ = unique_labels(y)
+        
+        # Store the number of features
+        self.n_features_in_ = X.shape[1]
+        
+        # Fit a standard QDA classifier
+        self.qda_ = QuadraticDiscriminantAnalysis(reg_param=self.reg_param)
+        self.qda_.fit(X, y)
+        
+        # Fit a nearest neighbors model for density estimation
+        self.nn_ = NearestNeighbors(n_neighbors=self.n_neighbors)
+        self.nn_.fit(X)
+        
+        # Store the training data
+        self.X_ = X
+        self.y_ = y
+        
+        return self
+
+    def predict(self, X):
+        # Check is fit had been called
+        check_is_fitted(self)
+        
+        # Input validation
+        X = check_array(X)
+        
+        # Check that the input features match the training data
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError("The number of features in predict is different from the number of features in fit.")
+        
+        # Get the distances to the nearest neighbors for each test point
+        distances, _ = self.nn_.kneighbors(X)
+        
+        # Calculate the average distance to the nearest neighbors
+        avg_distances = np.mean(distances, axis=1)
+        
+        # Normalize the distances
+        max_distance = np.max(avg_distances)
+        normalized_distances = avg_distances / max_distance
+        
+        # Determine which points should use QDA or LDA based on local density
+        use_qda = normalized_distances < self.complexity_threshold
+        
+        # Make predictions
+        y_pred = np.empty(X.shape[0], dtype=self.classes_.dtype)
+        
+        # Use QDA for points in dense regions
+        if np.any(use_qda):
+            y_pred[use_qda] = self.qda_.predict(X[use_qda])
+        
+        # Use LDA for points in sparse regions
+        if np.any(~use_qda):
+            # Compute class means and overall mean
+            class_means = [np.mean(self.X_[self.y_ == c], axis=0) for c in self.classes_]
+            overall_mean = np.mean(self.X_, axis=0)
+            
+            # Compute between-class scatter matrix
+            S_B = np.sum([np.outer(mean - overall_mean, mean - overall_mean) for mean in class_means], axis=0)
+            
+            # Compute within-class scatter matrix
+            S_W = np.sum([np.cov(self.X_[self.y_ == c].T) for c in self.classes_], axis=0)
+            
+            # Compute LDA projection matrix
+            eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
+            sorted_indices = np.argsort(eig_vals)[::-1]
+            W = eig_vecs[:, sorted_indices]
+            
+            # Project data onto LDA space
+            X_lda = X[~use_qda].dot(W)
+            class_means_lda = [mean.dot(W) for mean in class_means]
+            
+            # Classify based on nearest class mean in LDA space
+            distances = np.array([np.sum((X_lda - mean)**2, axis=1) for mean in class_means_lda])
+            y_pred[~use_qda] = self.classes_[np.argmin(distances, axis=0)]
+        
+        return y_pred
